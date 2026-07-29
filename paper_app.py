@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import streamlit as st
+from streamlit_autorefresh import st_autorefresh
 
 from api.fyers_login import FyersLogin
 from api.option_chain import OptionChain
+from api.supabase_paper import SupabasePaperStore
 from config import FYERS
 from paper_trading_ui import render_paper_trading
 
@@ -70,6 +72,12 @@ st.caption("Standalone app · live FYERS data · simulated orders only")
 
 with st.sidebar:
     st.header("FYERS Login")
+    auto_refresh = st.toggle("Auto-refresh live P&L", value=True)
+    refresh_seconds = st.slider("Refresh interval (seconds)", 5, 60, 10, step=5)
+    if SupabasePaperStore().enabled:
+        st.success("Supabase persistence: enabled")
+    else:
+        st.info("Supabase persistence: local fallback")
     credentials = {
         "FY_ID": st.text_input("Fyers ID", value=secret_value("FYERS_FY_ID", FYERS["FY_ID"])),
         "PIN": st.text_input("PIN", value=secret_value("FYERS_PIN", FYERS["PIN"]), type="password"),
@@ -89,5 +97,8 @@ try:
 except Exception as exc:
     st.error(f"FYERS login failed: {exc}")
     st.stop()
+
+if auto_refresh:
+    st_autorefresh(interval=refresh_seconds * 1000, key="paper_live_refresh")
 
 render_paper_trading(client, load_quotes, load_chain)

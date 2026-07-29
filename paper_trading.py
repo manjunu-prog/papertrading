@@ -14,6 +14,8 @@ from pathlib import Path
 
 import pandas as pd
 
+from api.supabase_paper import SupabasePaperStore
+
 
 DEFAULT_PORTFOLIOS = [
     ("NIFTY", f"NIFTY-SLOT-{slot}") for slot in range(1, 5)
@@ -29,10 +31,20 @@ def utc_now() -> str:
 
 
 class PaperTradingStore:
+    TABLE_MAP = {
+        "paper_portfolios": "portfolios",
+        "paper_orders": "orders",
+        "paper_fills": "fills",
+        "paper_positions": "positions",
+        "paper_equity_snapshots": "equity_snapshots",
+    }
+
     def __init__(self, path: str | Path | None = None):
         self.path = Path(path or Path(__file__).parent / "data" / "paper_trading.db")
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.remote = SupabasePaperStore()
         self._init_db()
+        self._restore_from_remote()
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path, timeout=20)
@@ -129,6 +141,35 @@ class PaperTradingStore:
                         (str(uuid.uuid4()), name, instrument, capital, capital, utc_now(), utc_now()),
                     )
 
+    def _local_state(self) -> dict[str, list[dict]]:
+        state = {}
+        with self._connect() as conn:
+            for remote_table, local_table in self.TABLE_MAP.items():
+                state[remote_table] = [dict(row) for row in conn.execute(f"SELECT * FROM {local_table}").fetchall()]
+        return state
+
+    def _restore_from_remote(self) -> None:
+        if not self.remote.enabled:
+            return
+        remote_state = self.remote.fetch_state()
+        if not remote_state or not remote_state.get("paper_portfolios"):
+            self._sync_remote()
+            return
+        with self._connect() as conn:
+            for remote_table in reversed(self.remote.tables):
+                conn.execute(f"DELETE FROM {self.TABLE_MAP[remote_table]}")
+            for remote_table in self.remote.tables:
+                rows = remote_state.get(remote_table, [])
+                table = self.TABLE_MAP[remote_table]
+                for row in rows:
+                    keys = list(row)
+                    placeholders = ",".join("?" for _ in keys)
+                    conn.execute(f"INSERT OR REPLACE INTO {table} ({','.join(keys)}) VALUES ({placeholders})", tuple(row[key] for key in keys))
+
+    def _sync_remote(self) -> None:
+        if self.remote.enabled:
+            self.remote.replace_state(self._local_state())
+
     def portfolios(self) -> pd.DataFrame:
         with self._connect() as conn:
             return pd.read_sql_query("SELECT * FROM portfolios ORDER BY instrument, name", conn)
@@ -149,6 +190,7 @@ class PaperTradingStore:
         assignments = ", ".join(f"{key}=?" for key in values)
         with self._connect() as conn:
             conn.execute(f"UPDATE portfolios SET {assignments} WHERE id=?", (*values.values(), portfolio_id))
+        self._sync_remote()
 
     def positions(self, portfolio_id: str) -> pd.DataFrame:
         with self._connect() as conn:
@@ -262,7 +304,9 @@ class PaperTradingStore:
             )
             if status == "FILLED":
                 self._fill_locked(conn, order_id, execution_price, quantity)
-            return dict(conn.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone())
+            result = dict(conn.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone())
+        self._sync_remote()
+        return result
 
     def _fill_locked(self, conn: sqlite3.Connection, order_id: str, price: float, quantity: int | None = None) -> None:
         row = conn.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone()
@@ -330,11 +374,14 @@ class PaperTradingStore:
                     price = float(limit_price or stop_price or ltp) if row["order_type"] == "LIMIT" else ltp
                     self._fill_locked(conn, row["id"], price)
                     filled += 1
+        if filled:
+            self._sync_remote()
         return filled
 
     def cancel_order(self, order_id: str) -> None:
         with self._connect() as conn:
             conn.execute("UPDATE orders SET status='CANCELLED',updated_at=? WHERE id=? AND status IN ('PENDING','PARTIAL')", (utc_now(), order_id))
+        self._sync_remote()
 
     def snapshot(self, portfolio_id: str, quotes: dict[str, dict]) -> None:
         with self._connect() as conn:
@@ -344,6 +391,7 @@ class PaperTradingStore:
                 "INSERT INTO equity_snapshots VALUES (?,?,?,?,?,?,?,?)",
                 (str(uuid.uuid4()), portfolio_id, utc_now(), stats["equity"], stats["cash"], stats["market_value"], stats["unrealized_pnl"], stats["margin_used"]),
             )
+        self._sync_remote()
 
     def reset_portfolio(self, portfolio_id: str) -> None:
         with self._connect() as conn:
@@ -353,6 +401,7 @@ class PaperTradingStore:
             conn.execute("DELETE FROM positions WHERE portfolio_id=?", (portfolio_id,))
             conn.execute("DELETE FROM equity_snapshots WHERE portfolio_id=?", (portfolio_id,))
             conn.execute("UPDATE portfolios SET cash=initial_capital,updated_at=? WHERE id=?", (utc_now(), portfolio_id))
+        self._sync_remote()
 
     def export(self, portfolio_id: str | None = None, fmt: str = "csv") -> bytes:
         frames = {

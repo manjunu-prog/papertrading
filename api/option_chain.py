@@ -48,6 +48,9 @@ class OptionChain:
                 # when the API response omits a separate expiry field.
                 match = re.search(r"(?:NIFTY|SENSEX)(\d{2}[A-Z]{3}\d{2}|\d{2}[A-Z]{3})", option_symbol)
                 expiry = match.group(1) if match else ""
+            if not expiry:
+                compact = re.search(r"(?:NIFTY|SENSEX)(\d{5})", option_symbol)
+                expiry = f"FYERS:{compact.group(1)}" if compact else "Current"
             records.append(
                 {
                     "symbol": option_symbol,

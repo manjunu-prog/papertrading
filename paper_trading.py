@@ -228,7 +228,8 @@ class PaperTradingStore:
         if order_type not in {"MARKET", "LIMIT", "SL", "SL-M"}:
             raise ValueError("Unsupported order type")
         ltp = float(quote.get("ltp") or 0)
-        execution_price = float(quote.get("ask") or ltp) if side == "BUY" else float(quote.get("bid") or ltp)
+        manual_price = float(order.get("execution_price") or 0)
+        execution_price = manual_price or (float(quote.get("ask") or ltp) if side == "BUY" else float(quote.get("bid") or ltp))
         if execution_price <= 0 and order_type == "MARKET":
             raise ValueError("A live LTP is required for a market paper order")
         reference = float(order.get("limit_price") or order.get("stop_price") or execution_price or 0)
@@ -256,7 +257,7 @@ class PaperTradingStore:
                     order_id, portfolio_id, now, now, order.get("instrument", ""), order.get("expiry", ""), order["symbol"],
                     order.get("option_type", ""), order.get("strike"), side, quantity, order_type,
                     order.get("limit_price"), order.get("stop_price"), execution_price if status == "FILLED" else None,
-                    status, order.get("product", "MIS"), order.get("tag", ""), "",
+                    status, order.get("product", "MIS"), order.get("tag", ""), order.get("reason", ""),
                 ),
             )
             if status == "FILLED":

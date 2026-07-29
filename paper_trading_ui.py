@@ -98,24 +98,36 @@ def render_paper_trading(client, quote_loader, chain_loader=None) -> None:
     symbol = contract["symbol"]
     quote = live_quotes.get(symbol) or quote_loader(client, [symbol]).get(symbol, {})
     ltp = float(quote.get("ltp") or contract.get("ltp") or 0)
+    chain_ltp = float(contract.get("ltp") or 0)
     qcols = st.columns(5)
     qcols[0].metric("LTP", _money(ltp))
     qcols[1].metric("Bid", _money(quote.get("bid")))
     qcols[2].metric("Ask", _money(quote.get("ask")))
     qcols[3].metric("OI", f"{float(contract.get('oi', 0) or 0):,.0f}")
     qcols[4].metric("IV", f"{float(contract.get('iv', 0) or 0):,.2f}")
+    st.caption(f"Selected FYERS symbol: `{symbol}` · Live quote is refreshed separately from the option-chain snapshot.")
+    if chain_ltp and ltp and abs(chain_ltp - ltp) > 0.01:
+        st.warning(f"FYERS chain snapshot differs from the live quote by {_money(ltp - chain_ltp)} ({((ltp - chain_ltp) / chain_ltp) * 100:+.2f}%). The live quote is used for the cross-check.")
 
     with st.form(f"order_form:{portfolio_id}", clear_on_submit=False):
-        order_cols = st.columns(6)
+        order_cols = st.columns(7)
         side = order_cols[0].selectbox("Side", ["BUY", "SELL"], key=f"side:{portfolio_id}")
         order_type = order_cols[1].selectbox("Order type", ["MARKET", "LIMIT", "SL", "SL-M"], key=f"type:{portfolio_id}")
         quantity = order_cols[2].number_input("Quantity", min_value=1, value=1, step=1, key=f"qty:{portfolio_id}")
         product = order_cols[3].selectbox("Product", ["MIS", "NRML"], key=f"product:{portfolio_id}")
-        price = order_cols[4].number_input("Limit / trigger", min_value=0.0, value=float(ltp), step=0.05, format="%.2f", key=f"price:{portfolio_id}")
-        tag = order_cols[5].text_input("Trade tag", value="manual", key=f"tag:{portfolio_id}")
+        price_source = order_cols[4].selectbox("Paper fill price", ["Manual paper price", "Live market bid/ask"], key=f"price_source:{portfolio_id}")
+        price = order_cols[5].number_input("Manual price / trigger", min_value=0.0, value=float(ltp), step=0.05, format="%.2f", key=f"price:{portfolio_id}")
+        tag = order_cols[6].text_input("Trade tag", value="manual", key=f"tag:{portfolio_id}")
         submitted = st.form_submit_button("Place paper order", type="primary")
+    tolerance = st.number_input("Manual-price warning threshold (%)", min_value=0.1, max_value=100.0, value=5.0, step=0.5, key=f"price_tolerance:{portfolio_id}")
+    manual_difference = ((price - ltp) / ltp) * 100 if price_source == "Manual paper price" and ltp else 0.0
+    if price_source == "Manual paper price":
+        st.info(f"Manual paper price: {_money(price)} · Live LTP: {_money(ltp)} · Difference: {manual_difference:+.2f}%")
+    confirm_difference = st.checkbox("Confirm manual price if it differs beyond the warning threshold", key=f"confirm_price:{portfolio_id}")
     if submitted:
         try:
+            if price_source == "Manual paper price" and abs(manual_difference) > tolerance and not confirm_difference:
+                raise ValueError("Manual price differs materially from the live quote. Confirm the cross-check before placing the paper order.")
             result = store.submit_order(
                 portfolio_id,
                 {
@@ -129,8 +141,10 @@ def render_paper_trading(client, quote_loader, chain_loader=None) -> None:
                     "order_type": order_type,
                     "limit_price": float(price) if order_type == "LIMIT" else None,
                     "stop_price": float(price) if order_type in {"SL", "SL-M"} else None,
+                    "execution_price": float(price) if price_source == "Manual paper price" and order_type == "MARKET" else None,
                     "product": product,
                     "tag": tag,
+                    "reason": f"price_source={price_source};live_ltp={ltp:.2f};manual_price={price:.2f}",
                 },
                 quote,
             )
@@ -187,4 +201,3 @@ def render_paper_trading(client, quote_loader, chain_loader=None) -> None:
                 store.reset_portfolio(portfolio_id)
                 st.success("Paper portfolio reset")
                 st.rerun()
-

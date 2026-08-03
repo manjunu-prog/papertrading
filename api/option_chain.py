@@ -24,11 +24,11 @@ class OptionChain:
     def __init__(self, client):
         self.client = client
 
-    def fetch(self, symbol: str, strikecount: int = 25, greeks: bool = True) -> pd.DataFrame:
+    def fetch(self, symbol: str, strikecount: int = 25, greeks: bool = True, timestamp: str | int | None = "") -> pd.DataFrame:
         payload = {
             "symbol": symbol,
             "strikecount": int(strikecount),
-            "timestamp": "",
+            "timestamp": "" if timestamp is None else str(timestamp),
             "greeks": "1" if greeks else "0",
         }
         response: dict[str, Any] = self.client.optionchain(data=payload)
@@ -77,6 +77,7 @@ class OptionChain:
             )
 
         df = pd.DataFrame.from_records(records)
+        df.attrs["expiry_data"] = response.get("data", {}).get("expiryData", [])
         if df.empty:
             return df
         return df.sort_values(["strike", "type"]).reset_index(drop=True)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import streamlit as st
@@ -78,21 +79,38 @@ def _inject_theme() -> None:
 def _expiry_choices(chain: pd.DataFrame) -> list[dict]:
     """Normalize FYERS expiryData into sorted UI choices."""
     choices = []
+    today = datetime.now(ZoneInfo("Asia/Kolkata")).date()
+
+    def parse_date(value):
+        if value in (None, ""):
+            return None
+        try:
+            text = str(value).strip()
+            if text.isdigit():
+                number = float(text)
+                if len(text) == 8 and text[:4].startswith(("19", "20")):
+                    return datetime.strptime(text, "%Y%m%d").date()
+                if number > 1_000_000_000_000:
+                    return pd.Timestamp(number, unit="ms", tz="Asia/Kolkata").date()
+                if number > 1_000_000_000:
+                    return pd.Timestamp(number, unit="s", tz="Asia/Kolkata").date()
+            parsed = pd.to_datetime(value, errors="coerce", dayfirst=True)
+            return None if pd.isna(parsed) else parsed.date()
+        except Exception:
+            return None
+
     for item in (chain.attrs.get("expiry_data", []) if isinstance(chain, pd.DataFrame) else []):
         if not isinstance(item, dict):
             continue
         raw_date = item.get("date") or item.get("expiry_date") or item.get("expiry")
         request_value = item.get("expiry") or item.get("timestamp") or item.get("date") or ""
-        parsed = None
-        try:
-            if isinstance(raw_date, (int, float)) or str(raw_date).isdigit():
-                number = float(raw_date)
-                if number > 1_000_000_000:
-                    parsed = pd.Timestamp(number, unit="s", tz="Asia/Kolkata").date()
-            if parsed is None:
-                parsed = pd.to_datetime(raw_date, errors="coerce").date()
-        except Exception:
-            parsed = None
+        candidates = [parse_date(raw_date), parse_date(request_value)]
+        future_candidates = [candidate for candidate in candidates if candidate and candidate >= today]
+        parsed = min(future_candidates) if future_candidates else None
+        if parsed is None:
+            # Expired records must never become a current slot. This prevents
+            # a stale FYERS date from being persisted as Slot 1.
+            continue
         label = parsed.strftime("%d %b %Y") if parsed else str(raw_date or request_value)
         if label and label not in {choice["label"] for choice in choices}:
             choices.append({"label": label, "timestamp": str(request_value), "sort": parsed or datetime.max.date()})

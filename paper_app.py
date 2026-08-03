@@ -67,11 +67,9 @@ def load_chain(_client, symbol: str, strikecount: int):
     return OptionChain(_client).fetch(symbol, strikecount=strikecount)
 
 
-st.title("Option Terminal Paper Trading")
-st.caption("Standalone app · live FYERS data · simulated orders only")
-
 with st.sidebar:
-    st.header("FYERS Login")
+    st.markdown("<div style='font-size:1.15rem;font-weight:800;color:#edf3fb;margin-bottom:1.2rem'>OPTION TERMINAL<br><span style='color:#ff686c;font-size:.78rem;letter-spacing:.12em'>PAPER DESK</span></div>", unsafe_allow_html=True)
+    st.header("Connection")
     auto_refresh = st.toggle("Auto-refresh live P&L", value=True)
     refresh_seconds = st.slider("Refresh interval (seconds)", 5, 60, 10, step=5)
     if SupabasePaperStore().enabled:

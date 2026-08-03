@@ -56,6 +56,10 @@ def _inject_theme() -> None:
         button[kind="primary"] p { color:white !important; font-weight:700; }
         [data-testid="stTabs"] button { color:#8e9aaa; font-weight:600; }
         [data-testid="stTabs"] button[aria-selected="true"] { color:#ff6d70; border-bottom-color:#ff5b5f; }
+        div[role="radiogroup"] { gap:.25rem; padding:.25rem 0 1.15rem; border-bottom:1px solid #202b38; margin-bottom:.8rem; }
+        div[role="radiogroup"] label { padding:.48rem .9rem; border-radius:999px; color:#8090a3; background:transparent; transition:all .15s ease; }
+        div[role="radiogroup"] label:has(input:checked) { background:#18a9bb; color:white; box-shadow:0 4px 16px rgba(24,169,187,.2); }
+        div[role="radiogroup"] label p { font-size:.82rem; font-weight:700; }
         [data-testid="stDataFrame"] { border:1px solid var(--line); border-radius:12px; overflow:hidden; }
         .paper-hero { display:flex; align-items:flex-start; justify-content:space-between; gap:20px; margin-bottom:1.15rem; }
         .paper-kicker { color:#ff6b6e; font-size:.72rem; letter-spacing:.16em; text-transform:uppercase; font-weight:800; margin-bottom:.35rem; }
@@ -103,6 +107,47 @@ def _slot_number(name: str) -> int:
         return 1
 
 
+def _render_position_table(store: PaperTradingStore, portfolio_id: str, live_quotes: dict[str, dict], shorts_only: bool = False) -> None:
+    positions = store.positions(portfolio_id)
+    if shorts_only and not positions.empty:
+        positions = positions[positions["quantity"] < 0].copy()
+    st.caption("These are your current open positions." if not shorts_only else "Short positions currently open in this portfolio.")
+    if positions.empty:
+        st.info("No open positions in this view.")
+        return
+
+    all_positions = positions.copy()
+    controls = st.columns([1, 2, 2, 1], gap="small")
+    page_size = controls[0].selectbox("Show", [10, 25, 50], index=0, key=f"position_page_size:{portfolio_id}:{shorts_only}")
+    search = controls[1].text_input("Search", placeholder="Search contract, strike, type…", key=f"position_search:{portfolio_id}:{shorts_only}")
+    close_target = controls[2].selectbox("Close position", ["Select a position"] + positions["symbol"].tolist(), key=f"close_target:{portfolio_id}:{shorts_only}")
+    close_action = controls[3].button("Close", type="primary", disabled=close_target == "Select a position", key=f"close_action:{portfolio_id}:{shorts_only}")
+    if search:
+        needle = search.lower()
+        positions = positions[positions.apply(lambda row: needle in " ".join(str(value).lower() for value in row.values), axis=1)]
+    positions = positions.head(int(page_size))
+    display = positions.copy()
+    display["LTP"] = display["symbol"].map(lambda item: (live_quotes.get(item) or {}).get("ltp"))
+    display["Unrealized P&L"] = (display["quantity"] * (display["LTP"] - display["average_price"])).round(2)
+    display["Return"] = ((display["LTP"] - display["average_price"]) / display["average_price"] * 100).round(2)
+    display = display.rename(columns={"symbol": "Contract", "option_type": "Type", "strike": "Strike", "quantity": "Qty", "average_price": "Avg Cost", "realized_pnl": "Realized P&L"})
+    display = display[["Contract", "expiry", "Type", "Strike", "Qty", "Avg Cost", "LTP", "Unrealized P&L", "Return"]].rename(columns={"expiry": "Expiry"})
+    st.dataframe(display, use_container_width=True, hide_index=True)
+    if close_action and close_target != "Select a position":
+        position = all_positions[all_positions["symbol"] == close_target].iloc[0]
+        quote = live_quotes.get(close_target, {})
+        try:
+            store.submit_order(
+                portfolio_id,
+                {"instrument": position["instrument"], "expiry": position["expiry"], "symbol": close_target, "option_type": position["option_type"], "strike": float(position["strike"]), "side": "BUY" if int(position["quantity"]) < 0 else "SELL", "quantity": abs(int(position["quantity"])), "order_type": "MARKET", "product": "MIS", "tag": "close-position", "reason": "Closed from positions page"},
+                quote,
+            )
+            st.success(f"Close order placed for {close_target}")
+            st.rerun()
+        except Exception as exc:
+            st.error(str(exc))
+
+
 def _sync_expiry_slots(store: PaperTradingStore, chain_loader, client) -> None:
     """Keep Slot 1..4 aligned with the next four live expiries per index."""
     if chain_loader is None:
@@ -119,9 +164,9 @@ def _sync_expiry_slots(store: PaperTradingStore, chain_loader, client) -> None:
         rows = current[current["instrument"] == instrument]
         for row in rows.itertuples():
             slot = _slot_number(row.name)
-            choice = choices[min(slot - 1, len(choices) - 1)]
-            if (row.expiry or "") != choice["label"]:
-                store.update_portfolio(row.id, expiry=choice["label"])
+            target = choices[slot - 1]["label"] if slot <= len(choices) else "No live expiry"
+            if (row.expiry or "") != target:
+                store.update_portfolio(row.id, expiry=target)
 
 
 def render_paper_trading(client, quote_loader, chain_loader=None) -> None:
@@ -141,6 +186,13 @@ def render_paper_trading(client, quote_loader, chain_loader=None) -> None:
     _sync_expiry_slots(store, chain_loader, client)
     portfolios, portfolio_id = _portfolio_selector(store)
     portfolio = store.portfolio(portfolio_id)
+    desk_view = st.radio(
+        "Desk view",
+        ["Positions", "Shorts", "Orders", "History", "Reserved", "Strategy", "Log", "Messages"],
+        horizontal=True,
+        label_visibility="collapsed",
+        key="desk_view",
+    )
 
     instrument = portfolio["instrument"]
     config = INDEX_CONFIG[instrument]
@@ -155,6 +207,9 @@ def render_paper_trading(client, quote_loader, chain_loader=None) -> None:
         fallback = sorted(chain_probe["expiry"].dropna().astype(str).unique().tolist()) if not chain_probe.empty and "expiry" in chain_probe else ["Current"]
         expiry_choices = [{"label": label, "timestamp": "", "sort": datetime.max.date()} for label in fallback]
     expiry_labels = [choice["label"] for choice in expiry_choices]
+    if portfolio["expiry"] == "No live expiry":
+        st.warning(f"{instrument} currently has only {len(expiry_labels)} available expiry contract(s). This slot is reserved until another valid expiry appears.")
+        return
     default_expiry = portfolio["expiry"] if portfolio["expiry"] in expiry_labels else expiry_labels[min(_slot_number(portfolio["name"]) - 1, len(expiry_labels) - 1)]
     selected_expiry = st.selectbox("Assigned expiry · slot-linked", expiry_labels, index=expiry_labels.index(default_expiry), key=f"ticket_expiry:{portfolio_id}")
     selected_expiry_data = next(choice for choice in expiry_choices if choice["label"] == selected_expiry)
@@ -182,6 +237,32 @@ def render_paper_trading(client, quote_loader, chain_loader=None) -> None:
     metric_cols[3].metric("Available Margin", _money(stats["available_margin"]))
     metric_cols[4].metric("Open Positions", len(stats["positions"]))
     metric_cols[5].metric("Pending Orders", int((store.orders(portfolio_id)["status"] == "PENDING").sum()))
+
+    if desk_view == "Positions":
+        st.markdown('<div class="section-label">Open positions</div>', unsafe_allow_html=True)
+        _render_position_table(store, portfolio_id, live_quotes)
+        return
+    if desk_view == "Shorts":
+        st.markdown('<div class="section-label">Short positions</div>', unsafe_allow_html=True)
+        _render_position_table(store, portfolio_id, live_quotes, shorts_only=True)
+        return
+    if desk_view == "History":
+        st.markdown('<div class="section-label">Trade history</div>', unsafe_allow_html=True)
+        fills = store.fills(portfolio_id)
+        st.dataframe(fills.drop(columns=["portfolio_id", "order_id", "id"], errors="ignore"), use_container_width=True, hide_index=True)
+        return
+    if desk_view == "Reserved":
+        st.markdown('<div class="section-label">Reserved capacity</div>', unsafe_allow_html=True)
+        st.info("Reserved portfolio capacity and future-expiry allocation will appear here.")
+        return
+    if desk_view == "Log":
+        st.markdown('<div class="section-label">System log</div>', unsafe_allow_html=True)
+        st.info("Paper execution and Supabase synchronization logs will appear here.")
+        return
+    if desk_view == "Messages":
+        st.markdown('<div class="section-label">Messages</div>', unsafe_allow_html=True)
+        st.info("No new messages.")
+        return
 
     with st.expander("Portfolio controls · risk limits · expiry assignment", expanded=False):
         setting_cols = st.columns(4)

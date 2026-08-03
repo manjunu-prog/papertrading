@@ -71,7 +71,7 @@ with st.sidebar:
     st.markdown("<div style='font-size:1.15rem;font-weight:800;color:#edf3fb;margin-bottom:1.2rem'>OPTION TERMINAL<br><span style='color:#ff686c;font-size:.78rem;letter-spacing:.12em'>PAPER DESK</span></div>", unsafe_allow_html=True)
     st.header("Connection")
     auto_refresh = st.toggle("Auto-refresh live P&L", value=True)
-    refresh_seconds = st.slider("Refresh interval (seconds)", 5, 60, 10, step=5)
+    refresh_seconds = st.slider("Refresh interval (minutes)", 1, 10, 2, step=1)
     if SupabasePaperStore().enabled:
         st.success("Supabase persistence: enabled")
     else:
@@ -97,6 +97,6 @@ except Exception as exc:
     st.stop()
 
 if auto_refresh:
-    st_autorefresh(interval=refresh_seconds * 1000, key="paper_live_refresh")
+    st_autorefresh(interval=refresh_seconds * 60 * 1000, key="paper_live_refresh")
 
 render_paper_trading(client, load_quotes, load_chain)

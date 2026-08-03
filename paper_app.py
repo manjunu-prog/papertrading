@@ -63,8 +63,8 @@ def load_quotes(_client, symbols: list[str]) -> dict[str, dict]:
 
 
 @st.cache_data(ttl=8, show_spinner=False)
-def load_chain(_client, symbol: str, strikecount: int):
-    return OptionChain(_client).fetch(symbol, strikecount=strikecount)
+def load_chain(_client, symbol: str, strikecount: int, timestamp: str = ""):
+    return OptionChain(_client).fetch(symbol, strikecount=strikecount, timestamp=timestamp)
 
 
 with st.sidebar:

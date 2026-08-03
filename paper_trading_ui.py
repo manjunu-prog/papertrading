@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import datetime
+
 import pandas as pd
 import streamlit as st
 
@@ -69,6 +71,59 @@ def _inject_theme() -> None:
     )
 
 
+def _expiry_choices(chain: pd.DataFrame) -> list[dict]:
+    """Normalize FYERS expiryData into sorted UI choices."""
+    choices = []
+    for item in (chain.attrs.get("expiry_data", []) if isinstance(chain, pd.DataFrame) else []):
+        if not isinstance(item, dict):
+            continue
+        raw_date = item.get("date") or item.get("expiry_date") or item.get("expiry")
+        request_value = item.get("expiry") or item.get("timestamp") or item.get("date") or ""
+        parsed = None
+        try:
+            if isinstance(raw_date, (int, float)) or str(raw_date).isdigit():
+                number = float(raw_date)
+                if number > 1_000_000_000:
+                    parsed = pd.Timestamp(number, unit="s", tz="Asia/Kolkata").date()
+            if parsed is None:
+                parsed = pd.to_datetime(raw_date, errors="coerce").date()
+        except Exception:
+            parsed = None
+        label = parsed.strftime("%d %b %Y") if parsed else str(raw_date or request_value)
+        if label and label not in {choice["label"] for choice in choices}:
+            choices.append({"label": label, "timestamp": str(request_value), "sort": parsed or datetime.max.date()})
+    choices.sort(key=lambda choice: choice["sort"])
+    return choices
+
+
+def _slot_number(name: str) -> int:
+    try:
+        return max(1, int(str(name).rsplit("-", 1)[-1]))
+    except (TypeError, ValueError):
+        return 1
+
+
+def _sync_expiry_slots(store: PaperTradingStore, chain_loader, client) -> None:
+    """Keep Slot 1..4 aligned with the next four live expiries per index."""
+    if chain_loader is None:
+        return
+    current = store.portfolios()
+    for instrument in ("NIFTY", "BANKNIFTY", "SENSEX"):
+        try:
+            probe = chain_loader(client, INDEX_CONFIG[instrument]["spot"], 25, "")
+        except Exception:
+            continue
+        choices = _expiry_choices(probe)
+        if not choices:
+            continue
+        rows = current[current["instrument"] == instrument]
+        for row in rows.itertuples():
+            slot = _slot_number(row.name)
+            choice = choices[min(slot - 1, len(choices) - 1)]
+            if (row.expiry or "") != choice["label"]:
+                store.update_portfolio(row.id, expiry=choice["label"])
+
+
 def render_paper_trading(client, quote_loader, chain_loader=None) -> None:
     _inject_theme()
     st.markdown(
@@ -83,15 +138,30 @@ def render_paper_trading(client, quote_loader, chain_loader=None) -> None:
         unsafe_allow_html=True,
     )
     store = PaperTradingStore()
+    _sync_expiry_slots(store, chain_loader, client)
     portfolios, portfolio_id = _portfolio_selector(store)
     portfolio = store.portfolio(portfolio_id)
 
     instrument = portfolio["instrument"]
     config = INDEX_CONFIG[instrument]
     try:
-        chain = chain_loader(client, config["spot"], 25) if chain_loader else OptionChain(client).fetch(config["spot"], strikecount=25)
+        chain_probe = chain_loader(client, config["spot"], 25, "") if chain_loader else OptionChain(client).fetch(config["spot"], strikecount=25)
     except Exception as exc:
         st.error(f"Unable to load live {instrument} option chain: {exc}")
+        chain_probe = pd.DataFrame()
+
+    expiry_choices = _expiry_choices(chain_probe)
+    if not expiry_choices:
+        fallback = sorted(chain_probe["expiry"].dropna().astype(str).unique().tolist()) if not chain_probe.empty and "expiry" in chain_probe else ["Current"]
+        expiry_choices = [{"label": label, "timestamp": "", "sort": datetime.max.date()} for label in fallback]
+    expiry_labels = [choice["label"] for choice in expiry_choices]
+    default_expiry = portfolio["expiry"] if portfolio["expiry"] in expiry_labels else expiry_labels[min(_slot_number(portfolio["name"]) - 1, len(expiry_labels) - 1)]
+    selected_expiry = st.selectbox("Assigned expiry · slot-linked", expiry_labels, index=expiry_labels.index(default_expiry), key=f"ticket_expiry:{portfolio_id}")
+    selected_expiry_data = next(choice for choice in expiry_choices if choice["label"] == selected_expiry)
+    try:
+        chain = chain_loader(client, config["spot"], 25, selected_expiry_data["timestamp"]) if chain_loader and selected_expiry_data["timestamp"] else chain_probe
+    except Exception as exc:
+        st.error(f"Unable to load {selected_expiry} option chain: {exc}")
         chain = pd.DataFrame()
 
     # Resolve the current symbol universe before processing pending orders.
@@ -115,12 +185,12 @@ def render_paper_trading(client, quote_loader, chain_loader=None) -> None:
 
     with st.expander("Portfolio controls · risk limits · expiry assignment", expanded=False):
         setting_cols = st.columns(4)
-        expiry_value = setting_cols[0].text_input("Assigned expiry label", value=portfolio["expiry"] or "", key=f"expiry:{portfolio_id}")
+        setting_cols[0].text_input("Assigned expiry · automatic", value=portfolio["expiry"] or selected_expiry, disabled=True, key=f"expiry:{portfolio_id}")
         capital = setting_cols[1].number_input("Starting capital", min_value=1000.0, value=float(portfolio["initial_capital"]), step=10000.0, key=f"capital:{portfolio_id}")
         max_loss = setting_cols[2].number_input("Max daily loss", min_value=0.0, value=float(portfolio["max_daily_loss"]), step=1000.0, key=f"loss:{portfolio_id}")
         max_order = setting_cols[3].number_input("Max order value", min_value=1000.0, value=float(portfolio["max_order_value"]), step=10000.0, key=f"order_limit:{portfolio_id}")
         if st.button("Save portfolio settings", key=f"save_settings:{portfolio_id}"):
-            store.update_portfolio(portfolio_id, expiry=expiry_value, initial_capital=capital, max_daily_loss=max_loss, max_order_value=max_order)
+            store.update_portfolio(portfolio_id, initial_capital=capital, max_daily_loss=max_loss, max_order_value=max_order)
             st.success("Portfolio settings saved")
 
     st.markdown(f'<div class="section-label">Execution ticket · {instrument}</div>', unsafe_allow_html=True)
@@ -129,13 +199,7 @@ def render_paper_trading(client, quote_loader, chain_loader=None) -> None:
         chain_view = pd.DataFrame()
     else:
         chain_view = chain.copy()
-        if "expiry" not in chain_view:
-            chain_view["expiry"] = "Current"
-        chain_view["expiry"] = chain_view["expiry"].replace("", "Current").fillna("Current").astype(str)
-        expiry_options = sorted(chain_view["expiry"].unique().tolist())
-        default_expiry = portfolio["expiry"] if portfolio["expiry"] in expiry_options else expiry_options[0]
-        expiry = st.selectbox("Expiry", expiry_options, index=expiry_options.index(default_expiry), key=f"ticket_expiry:{portfolio_id}")
-        chain_view = chain_view[chain_view["expiry"] == expiry].copy()
+        chain_view["expiry"] = selected_expiry
 
     if chain_view.empty:
         return
